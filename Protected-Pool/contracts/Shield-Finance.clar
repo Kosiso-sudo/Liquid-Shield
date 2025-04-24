@@ -14,10 +14,14 @@
 (define-constant ERR-PROTECTION-PERIOD-ACTIVE u7)
 (define-constant ERR-INVALID-PARAMETER u8)
 (define-constant ERR-MATH-ERROR u9)
+(define-constant ERR-INVALID-TOKEN u10)
+(define-constant ERR-INVALID-DECIMALS u11)
 
 (define-constant PRECISION-FACTOR u10000)
 (define-constant INITIAL-LIQUIDITY-TOKENS (pow u10 u18))
 (define-constant BLOCKS-PER-DAY u144) ;; Approximately 144 blocks per day in Stacks
+(define-constant MAX-DECIMALS u18)
+(define-constant NULL-PRINCIPAL 'SP000000000000000000002Q6VF78)
 
 ;; Protocol configuration
 (define-data-var protocol-fee-basis-points uint u30) ;; 0.3% fee (30 basis points)
@@ -49,6 +53,9 @@
   }
 )
 
+;; Whitelisted tokens
+(define-map whitelisted-tokens principal bool)
+
 ;; LiquidShield LP token
 (define-fungible-token liquidity-shares)
 
@@ -64,9 +71,50 @@
   (if (<= a b) a b)
 )
 
+;; Helper function to validate token
+(define-private (is-valid-token (token <ft-trait>))
+  (default-to false (map-get? whitelisted-tokens (contract-of token)))
+)
+
+;; Helper function to validate decimals
+(define-private (is-valid-decimals (decimals uint))
+  (and (>= decimals u0) (<= decimals MAX-DECIMALS))
+)
+
+;; Helper function to validate principal
+(define-private (is-valid-principal (token-principal principal))
+  (and 
+    (not (is-eq token-principal NULL-PRINCIPAL))
+    ;; Additional validation can be added here if needed
+    true
+  )
+)
+
+;; Add token to whitelist
+(define-public (add-whitelisted-token (token principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get protocol-admin)) (err ERR-UNAUTHORIZED-ACCESS))
+    ;; Validate token principal before using it
+    (asserts! (is-valid-principal token) (err ERR-INVALID-PARAMETER))
+    (ok (map-set whitelisted-tokens token true))
+  )
+)
+
+;; Remove token from whitelist
+(define-public (remove-whitelisted-token (token principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get protocol-admin)) (err ERR-UNAUTHORIZED-ACCESS))
+    ;; Validate token principal before using it
+    (asserts! (is-valid-principal token) (err ERR-INVALID-PARAMETER))
+    (ok (map-delete whitelisted-tokens token))
+  )
+)
+
 (define-public (transfer-admin-rights (new-admin principal))
   (begin
     (asserts! (is-eq tx-sender (var-get protocol-admin)) (err ERR-UNAUTHORIZED-ACCESS))
+    ;; Validate new admin is not null principal
+    (asserts! (not (is-eq new-admin NULL-PRINCIPAL)) (err ERR-INVALID-PARAMETER))
     (var-set protocol-admin new-admin)
     (ok new-admin)
   )
@@ -147,8 +195,20 @@
   )
 )
 
+;; Fixed function to return a consistent type (response uint uint)
 (define-read-only (calculate-normalized-price-ratio (amount-a uint) (amount-b uint) (decimals-a uint) (decimals-b uint))
-  (/ (* amount-a (pow u10 decimals-b)) (* amount-b (pow u10 decimals-a)))
+  (if (and (is-valid-decimals decimals-a) (is-valid-decimals decimals-b))
+    (ok (/ (* amount-a (pow u10 decimals-b)) (* amount-b (pow u10 decimals-a))))
+    (err ERR-INVALID-DECIMALS)
+  )
+)
+
+;; Helper function to safely unwrap price ratio calculation
+(define-private (unwrap-price-ratio (amount-a uint) (amount-b uint) (decimals-a uint) (decimals-b uint))
+  (match (calculate-normalized-price-ratio amount-a amount-b decimals-a decimals-b)
+    ratio-value ratio-value
+    error-code u0  ;; Default to 0 on error, but this should never happen due to prior validation
+  )
 )
 
 ;; Pool management functions
@@ -168,40 +228,52 @@
     )
     
     ;; Check conditions
+    (asserts! (is-valid-token token-a) (err ERR-INVALID-TOKEN))
+    (asserts! (is-valid-token token-b) (err ERR-INVALID-TOKEN))
+    (asserts! (not (is-eq token-a-address token-b-address)) (err ERR-INVALID-PARAMETER))
+    (asserts! (is-valid-decimals decimals-a) (err ERR-INVALID-DECIMALS))
+    (asserts! (is-valid-decimals decimals-b) (err ERR-INVALID-DECIMALS))
     (asserts! (not pool-exists) (err ERR-POOL-ALREADY-EXISTS))
     (asserts! (> initial-amount-a u0) (err ERR-ZERO-QUANTITY))
     (asserts! (> initial-amount-b u0) (err ERR-ZERO-QUANTITY))
     
-    ;; Transfer tokens to contract
-    (try! (contract-call? token-a transfer initial-amount-a tx-sender (as-contract tx-sender) none))
-    (try! (contract-call? token-b transfer initial-amount-b tx-sender (as-contract tx-sender) none))
-    
-    ;; Set up pool
-    (map-set liquidity-pools { token-a: token-a-address, token-b: token-b-address }
-      { 
-        total-liquidity: INITIAL-LIQUIDITY-TOKENS,
-        reserve-a: initial-amount-a,
-        reserve-b: initial-amount-b,
-        token-a-decimals: decimals-a,
-        token-b-decimals: decimals-b,
-        creation-height: current-block-height
-      }
+    ;; Calculate price ratio and validate
+    (match (calculate-normalized-price-ratio initial-amount-a initial-amount-b decimals-a decimals-b)
+      price-ratio
+        (begin
+          ;; Transfer tokens to contract
+          (try! (contract-call? token-a transfer initial-amount-a tx-sender (as-contract tx-sender) none))
+          (try! (contract-call? token-b transfer initial-amount-b tx-sender (as-contract tx-sender) none))
+          
+          ;; Set up pool
+          (map-set liquidity-pools { token-a: token-a-address, token-b: token-b-address }
+            { 
+              total-liquidity: INITIAL-LIQUIDITY-TOKENS,
+              reserve-a: initial-amount-a,
+              reserve-b: initial-amount-b,
+              token-a-decimals: decimals-a,
+              token-b-decimals: decimals-b,
+              creation-height: current-block-height
+            }
+          )
+          
+          ;; Record liquidity position
+          (map-set liquidity-positions 
+            { pool-id: { token-a: token-a-address, token-b: token-b-address }, provider: tx-sender }
+            {
+              shares-owned: INITIAL-LIQUIDITY-TOKENS,
+              initial-price-ratio: price-ratio,
+              entry-block-height: current-block-height,
+              token-a-contributed: initial-amount-a,
+              token-b-contributed: initial-amount-b
+            }
+          )
+          
+          ;; Mint LP tokens to provider
+          (ft-mint? liquidity-shares INITIAL-LIQUIDITY-TOKENS tx-sender)
+        )
+      error-code (err error-code)
     )
-    
-    ;; Record liquidity position
-    (map-set liquidity-positions 
-      { pool-id: { token-a: token-a-address, token-b: token-b-address }, provider: tx-sender }
-      {
-        shares-owned: INITIAL-LIQUIDITY-TOKENS,
-        initial-price-ratio: (calculate-normalized-price-ratio initial-amount-a initial-amount-b decimals-a decimals-b),
-        entry-block-height: current-block-height,
-        token-a-contributed: initial-amount-a,
-        token-b-contributed: initial-amount-b
-      }
-    )
-    
-    ;; Mint LP tokens to provider
-    (ft-mint? liquidity-shares INITIAL-LIQUIDITY-TOKENS tx-sender)
   )
 )
 
@@ -232,6 +304,9 @@
     )
     
     ;; Check conditions
+    (asserts! (is-valid-token token-a) (err ERR-INVALID-TOKEN))
+    (asserts! (is-valid-token token-b) (err ERR-INVALID-TOKEN))
+    (asserts! (not (is-eq token-a-address token-b-address)) (err ERR-INVALID-PARAMETER))
     (asserts! (> (get total-liquidity pool) u0) (err ERR-POOL-NOT-FOUND))
     (asserts! (> amount-a u0) (err ERR-ZERO-QUANTITY))
     (asserts! (> amount-b u0) (err ERR-ZERO-QUANTITY))
@@ -242,6 +317,8 @@
         (reserve-a (get reserve-a pool))
         (reserve-b (get reserve-b pool))
         (pool-liquidity (get total-liquidity pool))
+        (token-a-decimals (get token-a-decimals pool))
+        (token-b-decimals (get token-b-decimals pool))
 
         ;; Calculate square roots for geometric mean
         (sqrt-product-amounts (square-root-integer (* amount-a amount-b)))
@@ -249,56 +326,59 @@
         
         ;; Using geometric mean for balanced incentives
         (new-shares (/ (* pool-liquidity sqrt-product-amounts) sqrt-product-reserves))
-        
-        ;; Calculate current price ratio
-        (current-price-ratio (calculate-normalized-price-ratio 
-                               amount-a amount-b 
-                               (get token-a-decimals pool) 
-                               (get token-b-decimals pool)))
-        
-        ;; Update provider position
-        (updated-position (if (is-some existing-position)
-          {
-            shares-owned: (+ new-shares (get shares-owned (unwrap-panic existing-position))),
-            initial-price-ratio: current-price-ratio,  ;; Update to new entry price
-            entry-block-height: current-block-height,  ;; Reset protection clock
-            token-a-contributed: (+ amount-a (get token-a-contributed (unwrap-panic existing-position))),
-            token-b-contributed: (+ amount-b (get token-b-contributed (unwrap-panic existing-position)))
-          }
-          {
-            shares-owned: new-shares,
-            initial-price-ratio: current-price-ratio,
-            entry-block-height: current-block-height,
-            token-a-contributed: amount-a,
-            token-b-contributed: amount-b
-          }
-        ))
       )
       
-      ;; Check minimum shares requirement
-      (asserts! (>= new-shares minimum-shares) (err ERR-EXCESSIVE-SLIPPAGE))
-      
-      ;; Transfer tokens to contract
-      (try! (contract-call? token-a transfer amount-a tx-sender (as-contract tx-sender) none))
-      (try! (contract-call? token-b transfer amount-b tx-sender (as-contract tx-sender) none))
-      
-      ;; Update pool
-      (map-set liquidity-pools { token-a: token-a-address, token-b: token-b-address }
-        { 
-          total-liquidity: (+ pool-liquidity new-shares),
-          reserve-a: (+ reserve-a amount-a),
-          reserve-b: (+ reserve-b amount-b),
-          token-a-decimals: (get token-a-decimals pool),
-          token-b-decimals: (get token-b-decimals pool),
-          creation-height: (get creation-height pool)
-        }
+      ;; Calculate current price ratio and validate
+      (match (calculate-normalized-price-ratio amount-a amount-b token-a-decimals token-b-decimals)
+        current-price-ratio
+          (let
+            (
+              ;; Update provider position
+              (updated-position (if (is-some existing-position)
+                {
+                  shares-owned: (+ new-shares (get shares-owned (unwrap-panic existing-position))),
+                  initial-price-ratio: current-price-ratio,  ;; Update to new entry price
+                  entry-block-height: current-block-height,  ;; Reset protection clock
+                  token-a-contributed: (+ amount-a (get token-a-contributed (unwrap-panic existing-position))),
+                  token-b-contributed: (+ amount-b (get token-b-contributed (unwrap-panic existing-position)))
+                }
+                {
+                  shares-owned: new-shares,
+                  initial-price-ratio: current-price-ratio,
+                  entry-block-height: current-block-height,
+                  token-a-contributed: amount-a,
+                  token-b-contributed: amount-b
+                }
+              ))
+            )
+            
+            ;; Check minimum shares requirement
+            (asserts! (>= new-shares minimum-shares) (err ERR-EXCESSIVE-SLIPPAGE))
+            
+            ;; Transfer tokens to contract
+            (try! (contract-call? token-a transfer amount-a tx-sender (as-contract tx-sender) none))
+            (try! (contract-call? token-b transfer amount-b tx-sender (as-contract tx-sender) none))
+            
+            ;; Update pool
+            (map-set liquidity-pools { token-a: token-a-address, token-b: token-b-address }
+              { 
+                total-liquidity: (+ pool-liquidity new-shares),
+                reserve-a: (+ reserve-a amount-a),
+                reserve-b: (+ reserve-b amount-b),
+                token-a-decimals: token-a-decimals,
+                token-b-decimals: token-b-decimals,
+                creation-height: (get creation-height pool)
+              }
+            )
+            
+            ;; Update provider position
+            (map-set liquidity-positions provider-key updated-position)
+            
+            ;; Mint LP tokens to provider
+            (ft-mint? liquidity-shares new-shares tx-sender)
+          )
+        error-code (err error-code)
       )
-      
-      ;; Update provider position
-      (map-set liquidity-positions provider-key updated-position)
-      
-      ;; Mint LP tokens to provider
-      (ft-mint? liquidity-shares new-shares tx-sender)
     )
   )
 )
@@ -339,7 +419,11 @@
     )
     
     ;; Check conditions
+    (asserts! (is-valid-token token-a) (err ERR-INVALID-TOKEN))
+    (asserts! (is-valid-token token-b) (err ERR-INVALID-TOKEN))
+    (asserts! (not (is-eq token-a-address token-b-address)) (err ERR-INVALID-PARAMETER))
     (asserts! (> pool-total-shares u0) (err ERR-POOL-NOT-FOUND))
+    (asserts! (> shares-to-burn u0) (err ERR-ZERO-QUANTITY))
     (asserts! (<= shares-to-burn provider-total-shares) (err ERR-INSUFFICIENT-LIQUIDITY))
     
     ;; Calculate withdrawal amounts with impermanent loss protection
@@ -364,68 +448,76 @@
         
         ;; Entry price vs current price
         (entry-price-ratio (get initial-price-ratio provider-position))
-        (current-price-ratio (calculate-normalized-price-ratio 
-                               pool-reserve-a pool-reserve-b 
-                               (get token-a-decimals pool) (get token-b-decimals pool)))
-        
-        ;; Calculate compensation for impermanent loss
-        (token-a-shortfall (if (< current-token-a base-token-a) 
-                             (/ (* (- base-token-a current-token-a) protection-percentage) PRECISION-FACTOR) 
-                             u0))
-        (token-b-shortfall (if (< current-token-b base-token-b) 
-                             (/ (* (- base-token-b current-token-b) protection-percentage) PRECISION-FACTOR) 
-                             u0))
-        
-        (final-token-a (+ current-token-a token-a-shortfall))
-        (final-token-b (+ current-token-b token-b-shortfall))
-        
-        ;; Flag indicating if protection was applied
-        (protection-applied (> (+ token-a-shortfall token-b-shortfall) u0))
       )
       
-      ;; Check minimum amounts
-      (asserts! (>= final-token-a minimum-token-a) (err ERR-EXCESSIVE-SLIPPAGE))
-      (asserts! (>= final-token-b minimum-token-b) (err ERR-EXCESSIVE-SLIPPAGE))
-      
-      ;; Burn LP tokens
-      (try! (ft-burn? liquidity-shares shares-to-burn tx-sender))
-      
-      ;; Update pool
-      (map-set liquidity-pools { token-a: token-a-address, token-b: token-b-address }
-        { 
-          total-liquidity: (- pool-total-shares shares-to-burn),
-          reserve-a: (- pool-reserve-a final-token-a),
-          reserve-b: (- pool-reserve-b final-token-b),
-          token-a-decimals: (get token-a-decimals pool),
-          token-b-decimals: (get token-b-decimals pool),
-          creation-height: (get creation-height pool)
-        }
+      ;; Calculate current price ratio and validate
+      (match (calculate-normalized-price-ratio pool-reserve-a pool-reserve-b 
+                                              (get token-a-decimals pool) 
+                                              (get token-b-decimals pool))
+        current-price-ratio
+          (let
+            (
+              ;; Calculate compensation for impermanent loss
+              (token-a-shortfall (if (< current-token-a base-token-a) 
+                                  (/ (* (- base-token-a current-token-a) protection-percentage) PRECISION-FACTOR) 
+                                  u0))
+              (token-b-shortfall (if (< current-token-b base-token-b) 
+                                  (/ (* (- base-token-b current-token-b) protection-percentage) PRECISION-FACTOR) 
+                                  u0))
+              
+              (final-token-a (+ current-token-a token-a-shortfall))
+              (final-token-b (+ current-token-b token-b-shortfall))
+              
+              ;; Flag indicating if protection was applied
+              (protection-applied (> (+ token-a-shortfall token-b-shortfall) u0))
+            )
+            
+            ;; Check minimum amounts
+            (asserts! (>= final-token-a minimum-token-a) (err ERR-EXCESSIVE-SLIPPAGE))
+            (asserts! (>= final-token-b minimum-token-b) (err ERR-EXCESSIVE-SLIPPAGE))
+            
+            ;; Burn LP tokens
+            (try! (ft-burn? liquidity-shares shares-to-burn tx-sender))
+            
+            ;; Update pool
+            (map-set liquidity-pools { token-a: token-a-address, token-b: token-b-address }
+              { 
+                total-liquidity: (- pool-total-shares shares-to-burn),
+                reserve-a: (- pool-reserve-a final-token-a),
+                reserve-b: (- pool-reserve-b final-token-b),
+                token-a-decimals: (get token-a-decimals pool),
+                token-b-decimals: (get token-b-decimals pool),
+                creation-height: (get creation-height pool)
+              }
+            )
+            
+            ;; Update provider position
+            (if (is-eq shares-to-burn provider-total-shares)
+              (map-delete liquidity-positions provider-key)
+              (map-set liquidity-positions provider-key
+                {
+                  shares-owned: (- provider-total-shares shares-to-burn),
+                  initial-price-ratio: (get initial-price-ratio provider-position),
+                  entry-block-height: (get entry-block-height provider-position),
+                  token-a-contributed: (- (get token-a-contributed provider-position) base-token-a),
+                  token-b-contributed: (- (get token-b-contributed provider-position) base-token-b)
+                }
+              )
+            )
+            
+            ;; Transfer tokens to user
+            (as-contract (begin
+              (try! (contract-call? token-a transfer final-token-a (as-contract tx-sender) tx-sender none))
+              (try! (contract-call? token-b transfer final-token-b (as-contract tx-sender) tx-sender none))
+              (ok { 
+                token-a-amount: final-token-a, 
+                token-b-amount: final-token-b, 
+                protection-applied: protection-applied 
+              })
+            ))
+          )
+        error-code (err error-code)
       )
-      
-      ;; Update provider position
-      (if (is-eq shares-to-burn provider-total-shares)
-        (map-delete liquidity-positions provider-key)
-        (map-set liquidity-positions provider-key
-          {
-            shares-owned: (- provider-total-shares shares-to-burn),
-            initial-price-ratio: (get initial-price-ratio provider-position),
-            entry-block-height: (get entry-block-height provider-position),
-            token-a-contributed: (- (get token-a-contributed provider-position) base-token-a),
-            token-b-contributed: (- (get token-b-contributed provider-position) base-token-b)
-          }
-        )
-      )
-      
-      ;; Transfer tokens to user
-      (as-contract (begin
-        (try! (contract-call? token-a transfer final-token-a (as-contract tx-sender) tx-sender none))
-        (try! (contract-call? token-b transfer final-token-b (as-contract tx-sender) tx-sender none))
-        (ok { 
-          token-a-amount: final-token-a, 
-          token-b-amount: final-token-b, 
-          protection-applied: protection-applied 
-        })
-      ))
     )
   )
 )
@@ -461,6 +553,9 @@
     )
     
     ;; Check conditions
+    (asserts! (is-valid-token token-a) (err ERR-INVALID-TOKEN))
+    (asserts! (is-valid-token token-b) (err ERR-INVALID-TOKEN))
+    (asserts! (not (is-eq token-a-address token-b-address)) (err ERR-INVALID-PARAMETER))
     (asserts! (> (get total-liquidity pool) u0) (err ERR-POOL-NOT-FOUND))
     (asserts! (> input-amount u0) (err ERR-ZERO-QUANTITY))
     (asserts! (>= output-amount minimum-output-amount) (err ERR-EXCESSIVE-SLIPPAGE))
@@ -520,6 +615,9 @@
     )
     
     ;; Check conditions
+    (asserts! (is-valid-token token-a) (err ERR-INVALID-TOKEN))
+    (asserts! (is-valid-token token-b) (err ERR-INVALID-TOKEN))
+    (asserts! (not (is-eq token-a-address token-b-address)) (err ERR-INVALID-PARAMETER))
     (asserts! (> (get total-liquidity pool) u0) (err ERR-POOL-NOT-FOUND))
     (asserts! (> input-amount u0) (err ERR-ZERO-QUANTITY))
     (asserts! (>= output-amount minimum-output-amount) (err ERR-EXCESSIVE-SLIPPAGE))
@@ -564,6 +662,10 @@
 
 (define-read-only (get-current-fee)
   (var-get protocol-fee-basis-points)
+)
+
+(define-read-only (is-token-whitelisted (token principal))
+  (default-to false (map-get? whitelisted-tokens token))
 )
 
 (define-read-only (calculate-swap-a-to-b-output (token-a principal) (token-b principal) (input-amount uint))
